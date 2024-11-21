@@ -1,0 +1,187 @@
+---
+title: "A Simulated HSC population of an individual with CML"
+output: html_document
+date: "2024-10-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+library(rsimpop)
+library(cloneRate)
+library(ggplot2)
+
+source("PHYLOFIT.R")
+run_benchmark_sim=function(S=0.4,N=5e4,divrate_per_year=1,nyears_driver_acquisition = 10,nyears = 33,minprop=0.05){
+  run_selection_sim(0.1,## A rapid initial division rate (death rate=0) for embryogenesis. Precise value is not important in this application.
+                    final_division_rate = divrate_per_year/365,## symmetric division rate per day.
+                    target_pop_size = N, ## Carrying capacity. Once this is hit the aggregate death rate matches the aggregate
+                    nyears_driver_acquisition = nyears_driver_acquisition,
+                    nyears = nyears,
+                    fitness=log(1+S)/(divrate_per_year), ## Mutant division rate is (1+fitness)*division rate. 
+                    minprop = minprop)
+}
+get_subsampled_tree_fixed_prop=function(selsim,N=100,nmut=10){
+    mutants=which(selsim$edge[,2]<=length(selsim$tip.label) & selsim$driverid>0 & selsim$state>0)
+    wt=which(selsim$edge[,2]<=length(selsim$tip.label) & selsim$driverid==0 & selsim$state>0)
+    outgroup=which(selsim$edge[,2]<=length(selsim$tip.label) & selsim$state==0)
+    tips=selsim$edge[c(sample(mutants,nmut,replace = FALSE),sample(wt,N-nmut,replace=FALSE),outgroup),2]
+    get_subsampled_tree(selsim,-1,tips)
+}
+get_subtree_simple=function(selsim,N,nmut){
+  st=get_subsampled_tree_fixed_prop(selsim,N=N,nmut = nmut)
+  st=get_elapsed_time_tree(st)
+  st$edge.length=st$edge.length/365 ## Show in years.
+  list(st=st)
+}
+do_subsample_inference_and_plot_tree=function(selsim,nmut,maxtm=max(selsim$timestamp)/365){
+  st=get_subtree_simple(selsim,nmut,nmut)
+  justmutcladetree=drop.tip(st$st,st$st$tip.label[st$st$edge[st$st$state==0,2]]) ## drops the outgroup.
+  ## run phylofit
+  phylof=fit_clade(st$st,node = st$st$events %>% filter(value==1 & driverid==1) %>% pull(node),maxt = maxtm,nmutcolony = -1,nwtcolony = -1,maxSYear = exp(30)-1,refresh=FALSE)
+  ##
+  res=summary(phylof$res)$summary["s",c("2.5%","50%","97.5%")]
+  bd=birthDeathMCMC(justmutcladetree,maxGrowthRate = 30,nChains = 4,nCores = 4,chainLength = 2500)
+  txt1=sprintf("Phylofit       :s_est=%3.1f(%3.1f - %3.1f)",res[2],res[1],res[3])
+  txt2=with(maxLikelihood(justmutcladetree),sprintf("maxLikelihood :s_est=%3.1f(%3.1f - %3.1f)",estimate,lowerBound,upperBound))
+  txt3=with(bd,sprintf("birthDeathMCMC:s_est=%3.1f(%3.1f - %3.1f)",estimate,lowerBound,upperBound))
+  plot_tree(justmutcladetree,cex.label=0,mar = c(1,1,4,3)+0.1)
+  info=sprintf("%s\n%s\n%s",txt1,txt2,txt3)
+  title(info)
+  info
+}
+```
+
+## Simulated history of a hypothetical CML case.
+
+Here we simulate an individual patient with a rapidly growing clone, HSC population saturation and then TKI. 
+
+### Simulation of rapidly growing clone (s=11)
+
+```{r}
+sid=12345379
+zz=rsimpop::initSimPop(sid,bForce = TRUE)## Set seed.
+s=11
+S=exp(s)-1
+N=1e5
+nmut=60
+cat("S=",S,"\nS=",sprintf("%5.1f%%",S*100),"\ns=",s,"\n")
+dpy=1
+#set nyear such that 99.99% of the time the pure birthdeath would have a clone size=N.  
+##. N ~ exp(st)*Exp(rate=s/(1+s))
+## Solve cumulative distribution=p: 1-exp(rate*N*exp(-st))=1-p
+gett=function(s,N,p=0.99) -(1/s)*log(-log(p)/(N*(s/(1+s))))
+nyd=5## Year that the driver is acquired.  We set 5 years to avoid unnecessarily long simulation.
+nyear1=nyd+gett(s,N,p=0.9)
+nyear2=nyd+gett(s,N,p=0.9999)+ 3 ## Add 3 years to make the time at saturation longer.
+```
+```{r results='hide'}
+selsim=run_benchmark_sim(S=S,divrate_per_year = dpy,N = N,nyears_driver_acquisition = nyd,nyear=nyear1,minprop = 0.5)
+ggplot(data=data.frame(ts=selsim$timestamp/365,mutpop=selsim$totaldrivercount),aes(x=ts,y=mutpop))+geom_line()+
+  xlim(c(nyd-1,max(selsim$timestamp/365)+1))+xlab("Time (Years)")+ylab("Mutant Population Size")+ theme_bw()
+```
+
+### Sampled trees and inferred growth rates
+
+We only have one individual and take 9 hypothetical samples, each resulting in 60 colonies.  This might be the case for an incidental diagnosis.
+
+The inferred growth rates are generally quite accurate, reflecting the fact that expansion has been largely pure exponential growth
+
+```{r, fig.width=14,fig.height=12,results='hide'}
+par(mfcol=c(3,3))
+for(i in 1:9){
+  zz=do_subsample_inference_and_plot_tree(selsim,nmut)
+}
+```
+
+### Evolve clone at saturation population for about 3 years.
+
+Note that longer the periods of saturation will result in greater inaccuracy in methods that assume pure exponential growth.   
+
+```{r}
+params = selsim$params
+params[["n_sim_days"]] = nyear2*365
+params[["maxt"]] = NULL
+selsim2 = sim_pop(selsim, params = params, selsim$cfg)
+ggplot(data=data.frame(ts=selsim2$timestamp/365,mutpop=selsim2$totaldrivercount),aes(x=ts,y=mutpop))+geom_line()+
+  xlim(c(nyd-1,max(selsim2$timestamp/365)+1))+xlab("Time (Years)")+ylab("Mutant Population Size")+ theme_bw()
+```
+
+Again take hypothetical samples.   The estimated rates are very heterogeneous, and sometimes too low depending on whether late coalescences are captured:
+
+```{r, fig.width=14,fig.height=12,results='hide'}
+par(mfcol=c(3,3))
+for(i in 1:9){
+  zz=do_subsample_inference_and_plot_tree(selsim2,nmut)
+}
+```
+
+## Now apply TKI 
+
+Note that in the following we assume that TKI works by apoptosis which manifests as an increase in death rate, but division rate is maintained.   
+
+Assuming that MMR (x% clone size) is attained in time t (in years) then the corresponding growth rate "s" (actually negative representing contraction) is found by: $e^{s t}=x$ giving $s=\log(x)/t$. In the following we follow the example of PD57335 where at colony sampling the mutant fraction is around 20% after 0.6 years of TKI.   
+```{r}
+post.treatment.years=0.6
+oselsim=selsim
+selsim=selsim2
+## Put the driver in a separate compartment and specify the rate.  
+cfg=addCellCompartment(selsim$cfg,population=1e6,
+                       rate=(1+selsim$cfg$info %>% filter(id==1 & val==1) %>% pull("fitness"))*
+                         selsim$cfg$compartment %>% filter(val==1) %>% pull("rate"),
+                       descr="Post-TKI-Driver")
+idx=which(selsim$driverid==1 & selsim$edge[,2]<=Ntip(selsim)) ## select drivers
+
+selsim$state[idx]=2 #' switch to the new comparement (val=2)
+selsim$events=rbind(
+  selsim$events,
+  data.frame(value=2,driverid=1,node=selsim$edge[idx,2],ts=max(selsim$timestamp),uid=max(selsim$events$uid)+1:length(idx))
+) ## Update the events
+selsim$currentEventUID=max(selsim$event$uid)
+cfg$compartment$death_rate[3]=cfg$compartment$rate[3]-((1/365)*(log(0.2)/0.6))## MMR within 12 months
+cfg
+idx1=which(cfg$info$val==1 & cfg$info$id==1)
+idx2=which(cfg$info$val==2)
+cfg$info$population[idx2]=cfg$info$population[idx1]
+cfg$info$population[idx1]=0
+cfg$info$id[idx2]=1
+print(cfg)
+params = selsim$params
+params[["n_sim_days"]] = ceiling(max(selsim$timestamp)+post.treatment.years * 365)
+params[["maxt"]] = NULL
+```
+```{r results='hide'}
+selsim_tki = sim_pop(selsim %>% (function(x) {x$cfg=cfg;x}), params = params, cfg)
+selsim=oselsim ## 
+```
+
+The mutant population has shrunk:
+
+```{r}
+g1=ggplot(data=data.frame(ts=selsim_tki$timestamp/365,mutpop=selsim_tki$totaldrivercount),aes(x=ts,y=mutpop))+geom_line()+scale_x_continuous(limits=c(0,ceiling(max(selsim_tki$timestamp/365))),breaks=0:ceiling(max(selsim_tki$timestamp/365)))+xlab("Time (Years)")+ylab("Mutant Population Size")+ theme_bw()
+g1=g1+annotate("rect",xmin=nyd,xmax=nyear1,ymin=-Inf,ymax=Inf,fill="grey",alpha=0.2)
+g1=g1+annotate("rect",xmin=nyear1,xmax=nyear2,ymin=-Inf,ymax=Inf,fill="blue",alpha=0.2)
+g1=g1+annotate("rect",xmin=nyear2,xmax=max(selsim_tki$timestamp/365),ymin=-Inf,ymax=Inf,fill="red",alpha=0.2)
+print(g1)
+```
+
+Note that the sampled trees are exhibiting more late coalescences, resulting in much lower estimates of s for both birthDeathMCMC and maxLikelihood, but not for phylofit where the estimates are relatively stable.
+
+```{r, fig.width=14,fig.height=12,results='hide'}
+saveRDS(selsim_tki,"selsimTKI.RDS")
+par(mfcol=c(3,3))
+for(i in 1:9){
+  zz=do_subsample_inference_and_plot_tree(selsim_tki,nmut)
+}
+```
+
+## Conclusions
+
+It seems that Phylofit inferences of the early growth rate are relatively robust to later perturbations to mutant population growth trajectory.   
+
+
+
+
+

@@ -1,0 +1,31 @@
+group	number
+t(9;22)(q34;q11)	2
+BCR::ABL1	2
+DNMT3A	12
+NF1	3
+Tri8_AlleleA	5
+Tri8_AlleleB	5
+Tri8_AlleleC	5
+Tri8_AlleleD	5
+ASXL1	4
+loY	5
+loY_A	5
+loY_B	5
+loY_C	5
+loY_D	5
+Trisomy8	5
+Trisomy8A	5
+Trisomy8B	5
+Trisomy8C	5
+3UPD	5
+TET2	6
+CUX1	7
+TP53	8
+PHF6	9
+BCR	2
+Loss of Y	5
+Trisomy 8	5
+3p13-14Del	5
+RUNX1	13
+RB1	10
+STAG2	10
