@@ -1,0 +1,1058 @@
+---
+title: "CML Telomere mixed models"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+    theme: lumen
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  word_document:
+    toc: yes
+    toc_depth: '3'
+params:
+  code: TRUE
+  boot: TRUE
+---
+
+# Aim
+
+This analysis is to explore the best telomere mixed model to fit the CML colony data
+
+## Setup
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = params$code)
+knitr::opts_chunk$set(message = params$code)
+knitr::opts_chunk$set(warning = params$code)
+```
+
+### Libraries
+
+```{r libraries}
+knitr::opts_chunk$set(collapse = TRUE)
+  
+library(tidyverse)
+library(magrittr)
+
+library(ggbeeswarm)
+library(ggtext)
+library(ggeffects)
+library(ggnewscale)
+library(ggh4x)
+library(scales)
+library(patchwork)
+
+library(lme4)
+library(optimx)
+library(dfoptim)
+library(lmeresampler)
+
+library(sjPlot)
+library(performance)
+library(parameters)
+
+import::from(.from = "dplyr", count, select, rename, slice)
+```
+
+### Functions
+
+```{r Functions}
+# Add totals to df
+addTotal <-
+  function(df) {
+    df %>% mutate(across(where(is.logical), as.character)) %>%
+      bind_rows(summarise(.,
+                          across(where(is.numeric), sum,  na.rm = T),
+                          across(where(is.character), ~ "Total")))
+  }
+
+# Lmer optimiser QC
+
+# allfit summary 
+all_fit.summary <- function(all_fit) {
+  broom.mixed::glance(all_fit) %>%  select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+
+}
+
+
+# allfit compare estimated ranked by fit metrics
+all_fit.compare <- function(all_fit) {
+  Reduce(left_join, list(
+    broom.mixed::glance(all_fit), 
+    Reduce(bind_rows, list(broom.mixed::tidy(all_fit) %>% filter(effect == "fixed"),
+    lapply(all_fit, function(x){ x@optinfo$conv$opt}) %>% unlist() %>% enframe(name = "optimizer", value = "estimate") %>% mutate(term = "lme4.optimizer_code"),
+    lapply(all_fit, function(x){ as.numeric(isSingular(x))}) %>% unlist() %>% enframe(name = "optimizer", value = "estimate") %>% mutate(term = "isSingular"),
+    lapply(all_fit, function(x){ as.numeric(check_convergence(x))}) %>% unlist() %>% enframe(name = "optimizer", value = "estimate") %>% mutate(term = "Converged")
+  ))))  %>%
+  ggplot(aes(reorder(optimizer, -NLL_rel), estimate, colour = optimizer)) +
+  geom_point() +
+  facet_grid(0 ~ term, scale = "free_x") +
+  coord_flip() + guides(colour = "none") +  
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+
+}
+
+#  Model check
+model.check <- function(model) {
+  n <- rlang::expr_name(rlang::enexpr(model))
+  res <- enframe(c(
+    "Formula" = unlist(str_split(as.character(model@call), pattern = "\\="))[2],
+    "Observations" = nrow(model@frame),
+    "REML" = isREML(model),
+    "Optimizer" = model@optinfo$optimizer,
+    "Singular" = isSingular(model),
+    "Converged" = check_convergence(model)
+  )) %>%  tab_df(title = paste0("Model ", n),
+                 col.header = c("Test", "Value"))
+  return(res)
+}
+
+# get model formula
+get_formula <- function(model) {
+  str_sub(unlist(str_split(as.character(model@call), pattern = "\\="))[2])
+
+}
+
+```
+
+## Data
+
+```{r Data }
+per_sample_statistics.n834.df <- 
+  read_csv("../data/per_sample_statistics.n834.csv")
+
+driver.palette <- c(`Wild-type` = "#0072B5FF", Other ="#E18727FF",  `*BCR::ABL1*`="#BC3C29FF")
+driver.palette1 <- c(WT = "#0072B5FF", Other ="#E18727FF",  BCR_ABL="#BC3C29FF")
+driver.palette2 <- c(Wt = "#0072B5FF", Mt="#BC3C29FF")
+driver.palette2b <- c(Absence = "#717D6E", Presence="#BC3C29FF")
+```
+
+### Setup analysis variables
+
+```{r Setup analysis variables}
+# BCR::ABL1-mutated vs non mutated
+per_sample_statistics.n834.df %<>%
+  mutate(BCR_ABL1 = ifelse(grepl("BCR::ABL1", driver3, perl = T), "Mt", "Wt"))
+
+#  set Wt as ref
+per_sample_statistics.n834.df %<>%  mutate(BCR_ABL1 = factor(BCR_ABL1, levels = c("Wt", "Mt")))
+
+
+# BCR::ABL1-mutated vs Other driver vs wildtype
+per_sample_statistics.n834.df %<>% mutate(driver2 = ifelse(driver3 == "WT", "WT", ifelse(
+  grepl("BCR::ABL1", driver3, perl = T),
+  "BCR_ABL",
+  "Other"
+)))
+
+per_sample_statistics.n834.df %<>% mutate(driver2 = factor(driver2, levels = c("WT", "Other", "BCR_ABL")))
+
+# Set batch variable as character
+per_sample_statistics.n834.df %<>% mutate(library.cluster = as.character(library.cluster))
+```
+
+In total `r nrow(per_sample_statistics.n834.df)` samples passed QC across `r length(unique(per_sample_statistics.n834.df$Patient))` patients. Age (age_at_sample_exact) was defined as the count of completed years from birth at sampling and sample mutant status (BCR_ABL1) was defined as *BCR::ABL1* positive (Mt; n=`r sum(per_sample_statistics.n834.df$BCR_ABL1 == "Mt")`) or negative (Wt; n=`r sum(per_sample_statistics.n834.df$BCR_ABL1 == "Wt")`).
+
+```{r}
+per_sample_statistics.n834.df %>%
+  count(Patient, BCR_ABL1) %>%
+  pivot_wider(names_from = BCR_ABL1, values_from = n) %>%
+  addTotal() %>%
+  tab_df()
+```
+
+### Add labels
+
+```{r Add labels}
+attr(per_sample_statistics.n834.df$Length, "label") <- "Mean telomere length (bp)"
+attr(per_sample_statistics.n834.df$nsub_adj, "label") <- "SNV burden (depth adjusted)"
+attr(per_sample_statistics.n834.df$age_at_sample_exact, "label") <- "Age (years)"
+attr(per_sample_statistics.n834.df$BCR_ABL1, "label") <- "BCR::ABL1 status"
+attr(per_sample_statistics.n834.df$driver2, "label") <- "Driver status"
+```
+
+------------------------------------------------------------------------
+
+# Factors affecting telomere length estimation in NovaSeq sequencing
+
+Mitchell et al (2022) showed that telomerecat telomere length estimates from NovaSeq sequenced samples are problematic with very high estimates and zero length estimates compared to HiSeqX sequenced samples.
+
+## Read quality of telomeric reads
+
+We hypothesised that a likely contributing cause is the change from 4 colour (HiSeqX) to 2 colour (NovaSeq) sequencing. Therefore NovaSeq sequencing outputs a "G" when there is a "G" base and when there is an error, thus causing misattribution of telomeric reads by telomerecat.
+
+Reads containing telomeric repeats (from telomerecat telbam) show a marked increase in "G" content after 75bp.
+
+### Adjusting Telomerecat estimates
+
+Running Telomerecat with -t 75 "trims" read attribution to the first 75bp resulting in a decrease in outlier estimates.
+
+### Trimmed telomere length vs. age at sampling
+
+Plotting the trimmed telomerecat mean telomere lengths (bp) vs. age at sampling cohort (n=`r nrow(per_sample_statistics.n834.df)`) shows:
+
+-   The Wild-type trend is similar to the prior estimate from Mitchell et al.
+
+-   In most patients the *BCR::ABL1* mutated samples have shorter telomere lengths
+
+-   There seems to be no overt difference between wild-type and Other driver samples
+
+```{r fig.height = 5, fig.width = 18, echo=F, out.width= "100%"}
+# Setup facet xlim
+x_lim.df <-
+  per_sample_statistics.n834.df %>%  group_by(Patient) %>%  summarise(min = min(age_at_sample_exact),
+                                                                              max = max(age_at_sample_exact))
+
+x_scale <- lapply(1:nrow(x_lim.df), function(x) {
+  y = round(x_lim.df$min[x] + ((x_lim.df$max[x] - x_lim.df$min[x]) / 2))
+  scale_x_continuous(limits = c(y - 7, y + 7), breaks = pretty_breaks())
+})
+
+names(x_scale) <- x_lim.df$Patient
+
+per_sample_statistics.n834.df %>%
+  mutate(
+
+    Patient = factor(
+      Patient,
+      levels = c(
+        "PD57334",
+        "PD56961",
+        "PD57335",
+        "PD51634",
+        "PD51633",
+        "PD51632",
+        "PD51635",
+        "PD57333",
+        "PD57332"
+      )
+    ),
+    `*BCR::ABL1* status` = factor(
+      BCR_ABL1,
+      levels = c("Wt", "Mt"),
+      labels = c("Absence", "Presence")
+    ),
+    `Driver status` = factor(
+      driver2,
+      levels = c("BCR_ABL", "WT", "Other"),
+      labels = c("*BCR::ABL1*", "Wild-type", "Other")
+    ),
+    `Mean telomere length (bp)` = Length,
+    `Age (years)` = age_at_sample_exact,
+    group2 = paste0(Patient, "_", age_at_sample_exact, "_", `Driver status`)
+  ) %>%
+  ggplot(
+    aes(
+      `Age (years)`,
+      `Mean telomere length (bp)`,
+      colour = `*BCR::ABL1* status`,
+      group.by = group2
+    )
+  ) +
+  geom_quasirandom(width = 1, alpha = 0.6) +
+  scale_colour_manual(values = driver.palette2b) +
+  theme_bw(base_size = 16) +
+  theme(legend.title = element_markdown(), legend.text = element_markdown()) +
+  facet_grid( ~ Patient, scales = "free_x") +
+  guides(color = guide_legend(override.aes = list(linetype = c(rep(0, length(driver.palette2b)))))) +
+  new_scale_colour() +
+  scale_color_grey() +
+  geom_abline(
+    data = as_tibble(list(
+      a = 4512.38235,
+      b = -30.80877,
+      Reference = "Mitchell et al. -30bp/year"
+    )),
+    aes(
+      intercept = a,
+      slope = b,
+      colour = Reference
+    ),
+    lty = 2,
+    show.legend = TRUE
+  )  +
+  facetted_pos_scales(x = x_scale[c(
+    "PD57334",
+    "PD56961",
+    "PD57335",
+    "PD51634",
+    "PD51633",
+    "PD51632",
+    "PD51635",
+    "PD57333",
+    "PD57332"
+  )])
+
+        
+        
+```
+
+```{r fig.height = 5, fig.width = 18, out.width= "100%"}
+# Setup facet xlim
+x_lim.df <-
+  per_sample_statistics.n834.df %>%  group_by(Patient) %>%  summarise(min = min(age_at_sample_exact),
+                                                                              max = max(age_at_sample_exact))
+
+x_scale <- lapply(1:nrow(x_lim.df), function(x) {
+  y = round(x_lim.df$min[x] + ((x_lim.df$max[x] - x_lim.df$min[x]) / 2))
+  scale_x_continuous(limits = c(y - 7, y + 7), breaks = pretty_breaks())
+})
+
+names(x_scale) <- x_lim.df$Patient
+
+per_sample_statistics.n834.df %>%
+  mutate(
+    Patient = factor(
+      Patient,
+      levels = c(
+        "PD57334",
+        "PD56961",
+        "PD57335",
+        "PD51634",
+        "PD51633",
+        "PD51632",
+        "PD51635",
+        "PD57333",
+        "PD57332"
+      )
+    ),
+    `*BCR::ABL1* status` = factor(
+      BCR_ABL1,
+      levels = c("Wt", "Mt"),
+      labels = c("Absence", "Presence")
+    ),
+    `Driver status` = factor(
+      driver2,
+      levels = c("BCR_ABL", "WT", "Other"),
+      labels = c("*BCR::ABL1*", "Wild-type", "Other")
+    ),
+    `Mean telomere length (bp)` = Length,
+    `Age (years)` = age_at_sample_exact,
+    group2 = paste0(Patient, "_", age_at_sample_exact, "_", `Driver status`)
+  ) %>%
+  ggplot(
+    aes(
+      `Age (years)`,
+      `Mean telomere length (bp)`,
+      colour = `Driver status`,
+      group.by = group2
+    )
+  ) +
+  geom_quasirandom(width = 1, alpha = 0.6) +
+  scale_colour_manual(values = driver.palette) +
+  theme_bw(base_size = 16) +
+  theme(legend.title = element_markdown(), legend.text = element_markdown()) +
+  facet_grid( ~ Patient, scales = "free_x") +
+  guides(color = guide_legend(override.aes = list(linetype = c(rep(0, length(driver.palette)))))) +
+  new_scale_colour() +
+  scale_color_grey() +
+  geom_abline(
+    data = as_tibble(list(
+      a = 4512.38235,
+      b = -30.80877,
+      Reference = "Mitchell et al. -30bp/year"
+    )),
+    aes(
+      intercept = a,
+      slope = b,
+      colour = Reference
+    ),
+    lty = 2,
+    show.legend = TRUE
+  )  +
+  facetted_pos_scales(x = x_scale[c(
+    "PD57334",
+    "PD56961",
+    "PD57335",
+    "PD51634",
+    "PD51633",
+    "PD51632",
+    "PD51635",
+    "PD57333",
+    "PD57332"
+  )])
+
+        
+        
+```
+
+## Batch effects
+
+Unlike the SNV burden analysis where we have a well formed correction for sequencing depth given sensitivity of germline SNP recall and sample VAF, telomerecat telomere length estimation is likely to incur significant batch effects.
+
+Telomerecat estimates the mean telomere length using counts of telomeric reads (F1) and telomere boundary reads (F2_a). This makes it robust to ploidy with the assumption that F1 and F2_a reads are recalled at the same rate.
+
+We hypothesised that this assumption could be affected by:
+
+1.  Lower read depth - causing telomere boundary reads (F2_a) to be stochastically undersampled thereby giving an overestimate of telomere length
+
+2.  Sequencing library preparation - causing batch to batch variation in the ratio of F1/F2a reads
+
+### Recall of telomere boundary reads
+
+We could assume that in an diploid unbiased sample the number of telomere boundary reads (F2_a) divided by 46 should equal the sample sequencing coverage (Seq.X).
+
+In fact we see divergences from this assumption in 3-4 of our Patients with differences across the *BCR::ABL1* fusion status.
+
+```{r fig.height = 5, fig.width = 10, out.width= "100%"}
+per_sample_statistics.n834.df %>%
+  mutate(`*BCR::ABL1* status` = factor(
+    BCR_ABL1,
+    levels = c("Wt", "Mt"),
+    labels = c("Absence", "Presence")
+  )) %>%
+  ggplot(aes(Seq.X, F2a / 46, color = `*BCR::ABL1* status`)) +
+  geom_point(alpha =0.6) +
+  scale_colour_manual(values = driver.palette2b) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.title = element_markdown(),
+    legend.text = element_markdown(),
+    legend.position = "bottom"
+  ) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_grid(~ Patient)
+```
+
+The ratio of telomere boundary reads (F2a) to the sum of all boundary reads with telomeric repeats (F2 + F4) is lower in these samples, where we would expect the ratio to be similar at the patient-level.
+
+```{r fig.height = 5, fig.width = 10, out.width= "100%"}
+per_sample_statistics.n834.df %>%
+  ggplot(aes(Seq.X, F2a / 46, color = F2a / (F2 + F4))) +
+  geom_point() +
+  scale_color_viridis_c(option = "A",
+                        trans = scales::pseudo_log_trans(sigma = 0.001)) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "bottom"
+  ) +  geom_abline(intercept = 0, slope = 1) +
+  facet_grid( ~
+                Patient)
+```
+
+### Define candidate batch variables
+
+We defined two candidate batch variables:
+
+1.  The library preparation cluster (library.cluster), that is the library preparation date clustered by adjacent days (n=`r length(unique(per_sample_statistics.n834.df$library.cluster))`)
+
+2.  The unique sequence run ID (run_id.uniq) which is the concatenated flowcell IDs of for each sample (n=`r length(unique(per_sample_statistics.n834.df$run_id.uniq))`)
+
+With "run_id.uniq" a more granular variable which accounts for both library preparation cluster and sequencing batch.
+
+```{r , fig.height = 10, fig.width = 7, out.width= "100%"}
+library.cluster.panel <- 
+  per_sample_statistics.n834.df %>%
+  mutate(F2a_ratio = F2a / (F2 + F4)) %>%
+  filter(Patient  %in%  c("PD51632", "PD56961")) %>%
+  mutate(`*BCR::ABL1* status` = factor(
+    BCR_ABL1,
+    levels = c("Wt", "Mt"),
+    labels = c("Absence", "Presence")
+  )) %>%
+  select(
+    Patient,
+    `*BCR::ABL1* status`,
+    age_at_sample_exact,
+    library.cluster,
+    Length,
+    F2a_ratio,
+    Seq.X
+  ) %>% pivot_longer(cols = Length:Seq.X) %>%
+  mutate(name = factor(name, levels = c("Seq.X", "F2a_ratio", "Length"))) %>%
+  ggplot(aes(value, library.cluster, colour = `*BCR::ABL1* status`)) +
+  geom_quasirandom(width = 0.2 , alpha = 0.6) +
+  scale_colour_manual(values = driver.palette2b) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.title = element_markdown(),
+    legend.text = element_markdown(),
+    legend.position = "bottom"
+  ) +
+  facet_grid(Patient + age_at_sample_exact  ~ name, scales = "free")
+
+run_id.uniq.panel <-
+  per_sample_statistics.n834.df %>%
+  mutate(F2a_ratio = F2a / (F2 + F4)) %>%
+  filter(Patient  %in%  c("PD51632", "PD56961")) %>%
+  mutate(`*BCR::ABL1* status` = factor(
+    BCR_ABL1,
+    levels = c("Wt", "Mt"),
+    labels = c("Absence", "Presence")
+  )) %>%
+  select(
+    Patient,
+    `*BCR::ABL1* status`,
+    age_at_sample_exact,
+    run_id.uniq,
+    Length,
+    F2a_ratio,
+    Seq.X
+  ) %>% pivot_longer(cols = Length:Seq.X) %>%
+  mutate(name = factor(name, levels = c("Seq.X", "F2a_ratio", "Length"))) %>%
+  ggplot(aes(value, run_id.uniq, colour = `*BCR::ABL1* status`)) +
+  geom_quasirandom(width = 0.2 , alpha = 0.6) +
+  scale_colour_manual(values = driver.palette2b) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.title = element_markdown(),
+    legend.text = element_markdown(),
+    legend.position = "bottom"
+  ) +
+  facet_grid(Patient + age_at_sample_exact  ~ name, scales = "free")
+
+(library.cluster.panel / run_id.uniq.panel)  + plot_layout(guides = 'collect') &
+  theme(legend.position='bottom')
+```
+
+## Use of mixed models
+
+Linear mixed models implemented in the R package "lme4" were used due to the repeated measures at the patient-level in the data set. Models were fitted with default "lme4" parameters, if a model did not converge, lme4::allFit() was used to refit the model to all available optimisers (provide by the "lme4", "optimx", and "dfoptim" R packages), the best optimiser was selected from non-singular and converged refits with the highest negative log-likelihood. Only non-singular and converged models were considered for model selection using the Bayesian information criterion (BIC).
+
+## Batch variable selection in wild-type only model
+
+To identify an effective batch effect variable we restrict the data to *BCR::ABL*-ve samples (n=`r length(per_sample_statistics.n834.df%>% filter(BCR_ABL1 == "Wt") %>% .$BCR_ABL1)`) and compare each candidate batch effect variable to a baseline model with "age at sample" as a fixed effect and "patient" as a random effect.
+
+### Baseline model
+
+```{r}
+tel_wt.lmer_0 <-
+  lmer(
+    Length ~  age_at_sample_exact + (1 | Patient),
+    data = per_sample_statistics.n834.df%>% filter(BCR_ABL1 == "Wt"), REML = F
+  )
+
+model.check(tel_wt.lmer_0)
+```
+
+### library.cluster model
+
+```{r}
+tel_wt.lmer_0b <-
+  lmer(
+    Length ~  age_at_sample_exact +  (1 | Patient) + (1 | library.cluster),
+    data = per_sample_statistics.n834.df %>% filter(BCR_ABL1 == "Wt"), REML = F
+  )
+
+model.check(tel_wt.lmer_0b)
+```
+
+### run_id.uniq model
+
+```{r}
+tel_wt.lmer_0c <-
+  lmer(
+    Length ~  age_at_sample_exact + (1 | Patient) + (1 |  run_id.uniq),
+    data = per_sample_statistics.n834.df %>% filter(BCR_ABL1 == "Wt"), REML = F
+  )
+
+model.check(tel_wt.lmer_0c)
+```
+
+### Compare wild-type models
+
+Across all models the mean telomere length attrition rates estimates (per year) are compatible with Mitchell et al. 2022, showing that NovaSeq derived telomerecat mean telomere length can be used.
+
+Both candidate batch variables improve the baseline model's fit to the data, with "`r str_remove(get_formula(tel_wt.lmer_0c), Hmisc::escapeRegex(get_formula(tel_wt.lmer_0)))`" (`r deparse(substitute(tel.lmer_0c))`; BIC=`r round(BIC(tel_wt.lmer_0c),2)`) identified as the better variable over "`r str_remove(get_formula(tel_wt.lmer_0b), Hmisc::escapeRegex(get_formula(tel_wt.lmer_0)))`" (`r deparse(substitute(tel.lmer_0b))`; BIC=`r round(BIC(tel_wt.lmer_0b),2)`).
+
+```{r}
+tab_model(
+  tel_wt.lmer_0,
+  tel_wt.lmer_0b,
+  tel_wt.lmer_0c,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific",
+  dv.labels = c(
+    "Baseline (tel_wt.lmer_0)",
+    "library.cluster random effect (tel_wt.lmer_0b)",
+    "run_id.uniq random effect (tel_wt.lmer_0c)"
+  )
+)
+```
+
+#### ANOVA
+
+##### tel_wt.lmer_0 vs. tel_wt.lmer_0b
+
+```{r}
+broom::tidy(anova(tel_wt.lmer_0, tel_wt.lmer_0b)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+##### tel_wt.lmer_0 vs. tel_wt.lmer4_0c
+
+```{r}
+broom::tidy(anova(tel_wt.lmer_0, tel_wt.lmer_0c)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+------------------------------------------------------------------------
+
+# Telomere model analysis
+
+With a batch variable now selected we now look to model the effect of *BCR::ABL1* fusion status on mean telomere length, we will build the model (accounting for batch) in a stepwise fashion:
+
+1.  Confirm a *BCR::ABL* fusion status effect as a fixed effect only
+
+2.  Test the addition of explanatory variables to the random effect configuration
+
+## 1. Is there a *BCR::ABL1* fusion status effect on telomere length?
+
+Using the full dataset (n=`r nrow(per_sample_statistics.n834.df)`), we compare the inclusion of *BCR::ABL1* fusion status as a fixed effect to a null model "Length \~ age_at_sample_exact + (1 \| Patient) + (1\| run_id.uniq)".
+
+### Null model
+
+```{r}
+tel.lmer2_0 <-
+  lmer(
+    Length ~  age_at_sample_exact + (1 | Patient) + (1| run_id.uniq),
+    data = per_sample_statistics.n834.df , REML = F
+  )
+
+model.check(tel.lmer2_0)
+```
+
+### Model 1 - driver as fixed effect
+
+```{r}
+tel.lmer2_1 <-
+  lmer(
+    Length ~  age_at_sample_exact + BCR_ABL1 +  (1 | Patient) + (1| run_id.uniq),
+    data = per_sample_statistics.n834.df, REML = F
+  )
+
+model.check(tel.lmer2_1)
+```
+
+### Compare null to driver as fixed effect
+
+Adding *BCR::ABL* fusion status as a fixed effect improves the model fit to the data (`r deparse(substitute(tel.lmer2_1))`; BIC=`r round(BIC(tel.lmer2_1),2)`) over the null model (`r deparse(substitute(tel.lmer2_0))`; BIC=`r round(BIC(tel.lmer2_0),2)`), confirming a *BCR::ABL* fusion status effect.
+
+```{r}
+tab_model(
+  tel.lmer2_0,
+  tel.lmer2_1,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific",
+  dv.labels = c("Baseline (SNV.lmer_0)", "Driver as fixed effect (SNV.lmer2_1)")
+)
+```
+
+#### ANOVA
+
+```{r}
+broom::tidy(anova(tel.lmer2_0, tel.lmer2_1)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+## 2. Random effect configuration
+
+We now want to improve the baseline model (tel.lmer2_1), so we test whether "Patient" has an effect on the slope as well as the intercept in 3 models;
+
+-   Model 2 - age at sampling
+-   Model 3 - driver status
+
+### Model 2
+
+```{r}
+tel.lmer2_2 <-
+  lmer(
+    Length ~  age_at_sample_exact + BCR_ABL1 + (1 + age_at_sample_exact | Patient) + (1 | run_id.uniq),
+    data = per_sample_statistics.n834.df,
+    REML = F
+  )
+
+model.check(tel.lmer2_2)
+```
+
+### Model 3
+
+```{r}
+tel.lmer2_3 <-
+  lmer(
+    Length ~  age_at_sample_exact + BCR_ABL1 + (1 + BCR_ABL1 | Patient) + (1 | run_id.uniq),
+    data = per_sample_statistics.n834.df, REML = F
+  )
+
+model.check(tel.lmer2_3)
+```
+
+### Model comparison
+
+Model 2 was singular suggesting the random effect structure is too complex for the data and was dropped from the comparison to the baseline model (`r deparse(substitute(tel.lmer2_1))`:
+
+-   tel.lmer2_3: Length \~ age_at_sample_exact + BCR_ABL1 + (1 + BCR_ABL1 \| Patient) + (1 \| run_id.uniq)
+
+Incorporation of *BCR::ABL* fusion status into the patient-level random effect improves model fit to the data (`r deparse(substitute(tel.lmer2_3))`; BIC=`r format(round(BIC(tel.lmer2_3),2), scientific = FALSE)`) over the baseline model (`r deparse(substitute(tel.lmer2_1))`; BIC=`r format(round(BIC(tel.lmer2_1),2), scientific = FALSE)`).
+
+```{r}
+tab_model(
+  tel.lmer2_1,
+  tel.lmer2_3,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific",
+  dv.labels = c(
+    "Baseline (tel.lmer2_1)",
+    "Random driver effect and intercept: (tel.lmer2_3)"
+  )
+) 
+```
+
+#### ANOVA
+
+##### tel.lmer2_1 vs. tel.lmer2_3
+
+```{r}
+broom::tidy(anova(tel.lmer2_1, tel.lmer2_3)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+## 3. Final model
+
+### Refit with REML
+
+```{r}
+tel.lmer2_3.REML <-
+  update(
+    tel.lmer2_3,
+    REML = T,
+    control = lmerControl(
+      optimizer = tel.lmer2_3@optinfo$optimizer,
+      optCtrl = tel.lmer2_3@optinfo$control
+    )
+  )
+
+model.check(tel.lmer2_3.REML)
+```
+
+### Check model
+
+```{r , fig.height = 15, fig.width = 10, out.width= "100%"}
+check_model(tel.lmer2_3.REML)
+```
+
+### Model summary
+
+```{r}
+tab_model(
+  tel.lmer2_3.REML,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific"
+)
+```
+
+### Bootstrapped fixed effects CIs
+
+```{r Bootstrap, eval = params$boot}
+set.seed(1234)
+
+tel.lmer2_3_par_boot <-
+  bootstrap(
+    tel.lmer2_3.REML,
+    .f = fixef,
+    type = "parametric",
+    B = 3000
+  )
+tel.lmer2_3_par_boot
+```
+
+#### Restricted to first 1000/`r tel.lmer2_3_par_boot$B` bootstrapped models
+
+```{r, eval = params$boot}
+tel.lmer2_3_par_boot2 <- tel.lmer2_3_par_boot
+tel.lmer2_3_par_boot2$replicates <- tel.lmer2_3_par_boot$replicates[1:1000, ]
+lmeresampler:::confint.lmeresamp(tel.lmer2_3_par_boot, type = "perc") %>% tab_df()
+```
+
+```{r, eval = params$boot}
+keep.lgl.vec <- sapply(tel.lmer2_3_par_boot$message, is.null) & sapply(tel.lmer2_3_par_boot$warning, is.null) & sapply(tel.lmer2_3_par_boot$error, is.null)
+```
+
+#### Restricted to first 1000/`r sum(keep.lgl.vec)` converged non-singular bootstrapped models
+
+```{r, eval = params$boot}
+tel.lmer2_3_par_boot3 <- tel.lmer2_3_par_boot
+tel.lmer2_3_par_boot3$replicates <- tel.lmer2_3_par_boot$replicates[keep.lgl.vec, ][1:1000,]
+lmeresampler:::confint.lmeresamp(tel.lmer2_3_par_boot3, type = "perc") %>% tab_df()
+```
+
+### Plot final model
+
+```{r , fig.height = 10, fig.width = 14, out.width= "100%", eval = params$boot}
+
+d <-
+  ggpredict(
+    model = tel.lmer2_3.REML,
+    terms = c("age_at_sample_exact [0:90 by=5]", "BCR_ABL1"),
+    ci.lvl = 0.95,
+    type = "fe"
+  )
+
+tel_final <-
+d %>% as_tibble() %>%
+  mutate(group = case_when(group == "Wt" ~ "Absence", group == "Mt" ~ "Presence")) %>%
+  mutate(`*BCR::ABL1* status` := group) %>%
+  ggplot(aes(x = x,
+             y = predicted,
+             group = `*BCR::ABL1* status`,)) +
+  geom_line(aes(colour = `*BCR::ABL1* status`)) +
+  geom_ribbon(aes(ymin = conf.low,
+                  ymax = conf.high,
+                  fill  = `*BCR::ABL1* status`),
+              alpha = 0.2) +
+  scale_colour_manual(name = "*BCR::ABL1* status", values = driver.palette2b) +
+  scale_fill_manual(name = "*BCR::ABL1* status", values = driver.palette2b) +
+  new_scale_fill() +
+  new_scale_colour() +
+  geom_quasirandom(
+    data = per_sample_statistics.n834.df %>%
+      mutate(
+        response = Length,
+        x = age_at_sample_exact,
+        group = driver2
+      ) %>% mutate(`Driver status` = factor(
+        driver2,
+        levels = c("BCR_ABL", "WT", "Other"),
+        labels = c("*BCR::ABL1*", "Wild-type", "Other")
+      )) %>% mutate(`*BCR::ABL1* status` := group),
+    aes(x = x, y = response, colour = `Driver status`),
+    alpha = 0.5
+  ) +
+  scale_colour_manual(values = driver.palette) +
+  # scale_fill_manual(values = driver.palette) +
+  xlab(get_x_title(d)) +
+  ylab(get_y_title(d)) +
+  guides(colour = guide_legend(override.aes = list(linetype = c(rep(
+    0, length(driver.palette)
+  ))))) +
+  new_scale_colour() +
+  geom_abline(
+    data = as_tibble(
+      list(
+        a = 4512.38235,
+        b = -30.80877,
+        Reference = "Mitchell et al. -30bp/year"
+      )
+    ),
+    aes(
+      intercept = a,
+      slope = b,
+      colour = Reference
+    ),
+    lty = 2,
+    show.legend = TRUE
+  ) +
+  scale_colour_manual(values = "black") +
+  ggtitle(unlist(str_split(
+    as.character(tel.lmer2_3.REML@call), pattern = "\\="
+  ))[2]) +
+  theme_bw(base_size = 16) +
+  theme(legend.title = element_markdown(), legend.text = element_markdown()) 
+
+tel_final  
+```
+
+### Figure 3g
+
+Per patient estimated mean telomere length (bp) by age of sampling, annotated by driver status and mixed model trend lines.
+
+```{r fig.height = 5, fig.width = 18, echo=F, out.width= "100%", eval = params$boot}
+
+Figure_3g.dat <-
+  per_sample_statistics.n834.df %>%
+  mutate(
+    Patient = factor(
+      Patient,
+      levels = c(
+        "PD57334",
+        "PD56961",
+        "PD57335",
+        "PD51634",
+        "PD51633",
+        "PD51632",
+        "PD51635",
+        "PD57333",
+        "PD57332"
+      )
+    ),
+    `*BCR::ABL1* status` = factor(
+      BCR_ABL1,
+      levels = c("Wt", "Mt"),
+      labels = c("Absence", "Presence")
+    ),
+    `Driver status` = factor(
+      driver2,
+      levels = c("BCR_ABL", "WT", "Other"),
+      labels = c("*BCR::ABL1*", "Wild-type", "Other")
+    ),
+    `Mean telomere length (bp)` = Length,
+    `Age (years)` = age_at_sample_exact,
+    group2 = paste0(Patient, "_", age_at_sample_exact, "_", `Driver status`)
+  ) 
+
+Figure_3g <- 
+Figure_3g.dat %>%
+  ggplot(aes(`Age (years)`,
+    `Mean telomere length (bp)`,
+    colour = `Driver status`,
+  )) +
+  geom_quasirandom(width = 1, alpha = 0.5) +
+  scale_colour_manual(values = driver.palette, guide = guide_legend(order = 1)) +
+  theme_bw(base_size = 16) +
+  theme(legend.title = element_markdown(), legend.text = element_markdown()) +
+  facet_grid(~Patient, scales = "free_x") +
+  new_scale_colour() +
+  new_scale_fill() +
+  geom_line(
+    data = d %>% as_tibble() %>%
+      rename(
+        `Age (years)` = x,
+        `Mean telomere length (bp)` = predicted
+      ) %>%
+      mutate(group = case_when(
+        group == "Wt" ~ "Absence", group == "Mt" ~ "Presence"
+      )) %>%
+      mutate(`*BCR::ABL1* status` := group, `Driver status` = NA),
+    aes(
+      x = `Age (years)`,
+      y = `Mean telomere length (bp)`,
+      colour = `*BCR::ABL1* status`
+    )
+  ) +
+  geom_ribbon(
+    data = d %>% as_tibble() %>%
+      rename(
+        `Age (years)` = x,
+        `Mean telomere length (bp)` = predicted
+      ) %>%
+      mutate(group = case_when(
+        group == "Wt" ~ "Absence", group == "Mt" ~ "Presence"
+      )) %>%
+      mutate(`*BCR::ABL1* status` := group, `Driver status` = NA),
+    aes(
+      ymin = conf.low,
+      ymax = conf.high,
+      fill = `*BCR::ABL1* status`
+    ),
+    alpha = 0.2
+  ) +
+  scale_colour_manual(values = driver.palette2b) +
+  scale_fill_manual(values = driver.palette2b) +
+  facetted_pos_scales(x = x_scale[c(
+    "PD57334",
+    "PD56961",
+    "PD57335",
+    "PD51634",
+    "PD51633",
+    "PD51632",
+    "PD51635",
+    "PD57333",
+    "PD57332"
+  )])
+
+Figure_3g
+ggsave(
+  filename =  paste0("../figures/v1/", "figure_3g_V1.pdf"),
+  plot = Figure_3g,
+  width = 15,
+  height = 4.5
+)
+
+```
+
+### Figure 3h
+
+Per sample dot plot describing mean telomere length (bp) by sample clonal status for PD51635, faceted by time of sampling and annotated by per sample driver status. Clonal status was classified as samples with either *BCR::ABL1*, Other driver or coalescence after the first 100 mutations.
+
+```{r, fig.height = 4.5, fig.width = 4.5, out.width= "50%"}
+
+tel_length <- sym("Length")
+tel_length_label <- attr(per_sample_statistics.n834.df$Length, "label") 
+
+Figure_3h.dat <-
+  per_sample_statistics.n834.df %>%
+  filter(Patient == "PD51635", !is.na(status)) %>%
+  mutate(CH = ifelse(status == "NOCH" & driver3 != "WT", "CH", status)) %>% 
+  mutate(
+    group = paste0(Patient, CH),
+    Patient = factor(
+      Patient,
+      levels = c(
+        "PD57334",
+        "PD56961",
+        "PD57335",
+        "PD51634",
+        "PD51633",
+        "PD51632",
+        "PD51635",
+        "PD57333",
+        "PD57332"
+      )
+    ),
+    `*BCR::ABL1* status` = factor(
+      BCR_ABL1,
+      levels = c("Wt", "Mt", "Normal"),
+      labels = c("Absence", "Presence", "Normal")
+    ),
+     `Driver status` = factor(
+      driver2,
+      levels = c("BCR_ABL", "Other", "WT"),
+      labels = c("*BCR::ABL1*", "Other", "Wild-type")
+    ),
+    `Clonal status` = factor(
+      CH,
+      levels = c("CH", "NOCH"),
+      labels = c("+", "-")
+    ),
+    {
+      {
+        tel_length_label
+      }
+    } := !!tel_length,
+    `Mutations SNV (adjusted)` = nsub_adj,
+    `Age (years)` = age_at_sample_exact
+  ) 
+  
+Figure_3h <- 
+  Figure_3h.dat %>% 
+    ggplot(aes(
+      `Clonal status`,
+      !!sym(tel_length_label),
+      colour = `Driver status`,
+      group.by = group,
+    )) +
+    geom_quasirandom(width = 0.4, alpha = 0.5) +
+    scale_colour_manual(values = driver.palette) +
+    theme_bw(base_size = 16) +
+    theme(legend.text = element_markdown()) +
+    facet_nested(~ Patient + `Age (years)`, scales = "free_x") +
+    force_panelsizes(cols = c(1, 2)) + theme(panel.spacing = unit(0, "lines"))
+
+Figure_3h
+ggsave(filename =  paste0("../figures/v1/", "figure_3h_V1.pdf"), plot = Figure_3h, width = 4.5, height =4.5 )
+
+```
+
+## SessionInfo
+```{r}
+sessionInfo()
+```
+

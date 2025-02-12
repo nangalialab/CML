@@ -8,7 +8,7 @@ library(RVAideMemoire)
 library(DescTools)
 library(ggpubr)
 library(cloneRate)
-VERSION="REVISION_V2"
+VERSION="v1"
 writeLines(VERSION,"../export/VERSION.txt")
 pdd_cache="../cache/PDD.RDS"
 ## We set a separate seed for each stage of the analysis to facilitate 

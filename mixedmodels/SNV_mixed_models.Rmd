@@ -1,0 +1,657 @@
+---
+title: "CML SNV mixed models"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+    toc: yes
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+    theme: lumen
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  word_document:
+    toc: yes
+    toc_depth: '3'
+params:
+  code: TRUE
+  boot: TRUE
+---
+
+# Aim
+
+This analysis is to explore the best SNV burden mixed model to fit the CML colony data
+
+## Setup
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = params$code)
+knitr::opts_chunk$set(message = params$code)
+knitr::opts_chunk$set(warning = params$code)
+```
+
+### Libraries
+
+```{r libraries}
+knitr::opts_chunk$set(collapse = TRUE)
+  
+library(tidyverse)
+library(magrittr)
+
+library(ggbeeswarm)
+library(ggtext)
+library(ggeffects)
+library(ggnewscale)
+library(ggh4x)
+library(scales)
+library(patchwork)
+
+library(lme4)
+library(optimx)
+library(dfoptim)
+library(lmeresampler)
+
+library(sjPlot)
+library(performance)
+library(parameters)
+
+import::from(.from = "dplyr", count, select, rename, slice)
+```
+
+### Functions
+
+```{r Functions}
+# Add totals to df
+addTotal <-
+  function(df) {
+    df %>% mutate(across(where(is.logical), as.character)) %>%
+      bind_rows(summarise(.,
+                          across(where(is.numeric), sum,  na.rm = T),
+                          across(where(is.character), ~ "Total")))
+  }
+
+# Lmer optimiser QC
+
+# allfit summary 
+all_fit.summary <- function(all_fit) {
+  broom.mixed::glance(all_fit) %>%  select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+
+}
+
+
+# allfit compare estimated ranked by fit metrics
+all_fit.compare <- function(all_fit) {
+  Reduce(left_join, list(
+    broom.mixed::glance(all_fit), 
+    Reduce(bind_rows, list(broom.mixed::tidy(all_fit) %>% filter(effect == "fixed"),
+    lapply(all_fit, function(x){ x@optinfo$conv$opt}) %>% unlist() %>% enframe(name = "optimizer", value = "estimate") %>% mutate(term = "lme4.optimizer_code"),
+    lapply(all_fit, function(x){ as.numeric(isSingular(x))}) %>% unlist() %>% enframe(name = "optimizer", value = "estimate") %>% mutate(term = "isSingular"),
+    lapply(all_fit, function(x){ as.numeric(check_convergence(x))}) %>% unlist() %>% enframe(name = "optimizer", value = "estimate") %>% mutate(term = "Converged")
+  ))))  %>%
+  ggplot(aes(reorder(optimizer, -NLL_rel), estimate, colour = optimizer)) +
+  geom_point() +
+  facet_grid(0 ~ term, scale = "free_x") +
+  coord_flip() + guides(colour = "none") +  
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+
+}
+
+#  Model check
+model.check <- function(model) {
+  n <- rlang::expr_name(rlang::enexpr(model))
+  res <- enframe(c(
+    "Formula" = unlist(str_split(as.character(model@call), pattern = "\\="))[2],
+    "Observations" = nrow(model@frame),
+    "REML" = isREML(model),
+    "Optimizer" = model@optinfo$optimizer,
+    "Singular" = isSingular(model),
+    "Converged" = check_convergence(model)
+  )) %>%  tab_df(title = paste0("Model ", n),
+                 col.header = c("Test", "Value"))
+  return(res)
+}
+
+# get model formula
+get_formula <- function(model) {
+  str_sub(unlist(str_split(as.character(model@call), pattern = "\\="))[2])
+
+}
+
+```
+
+## Data
+
+```{r Data }
+per_sample_statistics.n834.df <- 
+  read_csv("../data/per_sample_statistics.n834.csv")
+
+driver.palette <- c(`Wild-type` = "#0072B5FF", Other ="#E18727FF",  `*BCR::ABL1*`="#BC3C29FF")
+driver.palette1 <- c(WT = "#0072B5FF", Other ="#E18727FF",  BCR_ABL="#BC3C29FF")
+driver.palette2 <- c(Wt = "#0072B5FF", Mt="#BC3C29FF")
+driver.palette2b <- c(Absence = "#717D6E", Presence="#BC3C29FF")
+```
+
+### Setup analysis variables
+
+```{r Setup analysis variables}
+# BCR::ABL1-mutated vs non mutated
+per_sample_statistics.n834.df %<>%
+  mutate(BCR_ABL1 = ifelse(grepl("BCR::ABL1", driver3, perl = T), "Mt", "Wt"))
+
+#  set Wt as ref
+per_sample_statistics.n834.df %<>%  mutate(BCR_ABL1 = factor(BCR_ABL1, levels = c("Wt", "Mt")))
+
+
+# BCR::ABL1-mutated vs Other driver vs wildtype
+per_sample_statistics.n834.df %<>% mutate(driver2 = ifelse(driver3 == "WT", "WT", ifelse(
+  grepl("BCR::ABL1", driver3, perl = T),
+  "BCR_ABL",
+  "Other"
+)))
+
+per_sample_statistics.n834.df %<>% mutate(driver2 = factor(driver2, levels = c("WT", "Other", "BCR_ABL")))
+
+# Set batch variable as character
+per_sample_statistics.n834.df %<>% mutate(library.cluster = as.character(library.cluster))
+```
+
+In total `r nrow(per_sample_statistics.n834.df)` samples passed QC across `r length(unique(per_sample_statistics.n834.df$Patient))` patients. Age (age_at_sample_exact) was defined as the count of completed years from birth at sampling and sample mutant status (BCR_ABL1) was defined as *BCR::ABL1* positive (Mt; n=`r sum(per_sample_statistics.n834.df$BCR_ABL1 == "Mt")`) or negative (Wt; n=`r sum(per_sample_statistics.n834.df$BCR_ABL1 == "Wt")`).
+
+```{r}
+per_sample_statistics.n834.df %>%  count(Patient, BCR_ABL1) %>% pivot_wider(names_from = BCR_ABL1, values_from = n) %>%  addTotal() %>%  tab_df()
+```
+
+### Add labels
+
+```{r Add labels}
+attr(per_sample_statistics.n834.df$Length, "label") <- "Mean telomere length (bp)"
+attr(per_sample_statistics.n834.df$nsub_adj, "label") <- "SNV burden (depth adjusted)"
+attr(per_sample_statistics.n834.df$age_at_sample_exact, "label") <- "Age (years)"
+attr(per_sample_statistics.n834.df$BCR_ABL1, "label") <- "BCR::ABL1 status"
+attr(per_sample_statistics.n834.df$driver2, "label") <- "Driver status"
+```
+
+## Use of mixed models
+
+Linear mixed models implemented in the R package "lme4" were used due to the repeated measures at the patient-level in the data set. Models were fitted with default "lme4" parameters, if a model did not converge, lme4::allFit() was used to refit the model to all available optimisers (provide by the "lme4", "optimx", and "dfoptim" R packages), the best optimiser was selected from non-singular and converged refits with the highest negative log-likelihood. Only non-singular and converged models were considered for model selection using the Bayesian information criterion (BIC).
+
+# SNV model analysis
+
+To model the effect of *BCR::ABL1* fusion status on SNV burden (nsub_adj), we will build the model (accounting for batch) in a stepwise fashion:
+
+1.  Confirm a *BCR::ABL* fusion status effect as a fixed effect only
+
+2.  Test the addition of explanatory variables to the random effect configuration
+
+## 0. Remove PD57332 samples due to lack of wild-type
+
+```{r}
+per_sample_statistics.n799.df <- per_sample_statistics.n834.df %>%  filter(Patient != "PD57332")
+plot3a.per_sample_statistics.n834.df <- per_sample_statistics.n834.df
+rm(per_sample_statistics.n834.df)
+```
+
+As PD57332 didn't have any wild-type colonies our estimations of SNV mutation burden (nsub_adj) were expected to be biased, therefore we removed this patient from SNV burden analysis, leaving `r nrow(per_sample_statistics.n799.df)` samples passed QC across `r length(unique(per_sample_statistics.n799.df$Patient))` patients. Age (age_at_sample_exact) was defined as the count of completed years from birth at sampling and sample mutant status (BCR_ABL1) was defined as *BCR::ABL1* positive (Mt; n=`r sum(per_sample_statistics.n799.df$BCR_ABL1 == "Mt")`) or negative (Wt; n=`r sum(per_sample_statistics.n799.df$BCR_ABL1 == "Wt")`).
+
+```{r}
+per_sample_statistics.n799.df %>%  count(Patient, BCR_ABL1) %>% pivot_wider(names_from = BCR_ABL1, values_from = n) %>%  addTotal() %>%  tab_df()
+```
+
+## 1. Is there a driver (2-level, BCR::ABL1 or non-BCR::ABL1) effect on SNV nsub_adj?
+
+Using the subset dataset (n=`r nrow(per_sample_statistics.n799.df)`), we compare the inclusion of *BCR::ABL1* fusion status as a fixed effect to a null model "nsub_adj \~ age_at_sample_exact + (1 \| Patient)".
+
+#### Null model
+
+```{r}
+SNV.lmer_0 <-
+  lmer(
+    nsub_adj ~  age_at_sample_exact + (1 | Patient),
+    data = per_sample_statistics.n799.df , REML = F
+  )
+
+model.check(SNV.lmer_0)
+```
+
+#### Model 1 - driver as fixed effect
+
+```{r}
+SNV.lmer2_1 <-
+  lmer(
+    nsub_adj ~  age_at_sample_exact + BCR_ABL1 +  (1 | Patient),
+    data = per_sample_statistics.n799.df, REML = F
+  )
+
+model.check(SNV.lmer2_1)
+```
+
+### Compare null to driver as fixed effect
+
+Adding *BCR::ABL* fusion status as a fixed effect improves the model fit to the data (`r deparse(substitute(SNV.lmer2_1))`; BIC=`r round(BIC(SNV.lmer2_1),2)`) over the null model (`r deparse(substitute(SNV.lmer_0))`; BIC=`r round(BIC(SNV.lmer_0),2)`), confirming a *BCR::ABL* fusion status effect.
+
+```{r}
+tab_model(
+  SNV.lmer_0,
+  SNV.lmer2_1,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific",
+  dv.labels = c("Baseline (SNV.lmer_0)", "Driver as fixed effect (SNV.lmer2_1)")
+)
+```
+
+#### ANOVA
+
+```{r}
+broom::tidy(anova(SNV.lmer_0, SNV.lmer2_1)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+## 2. Random effect configuration
+
+We now want to improve the model, so we test whether "Patient" has an effect on the slope as well as the intercept in 3 models;
+
+-   Model 2 - Age at sampling
+-   Model 3 - *BCR::ABL* fusion status
+
+#### Model 2
+
+```{r}
+SNV.lmer2_2 <-
+  lmer(
+    nsub_adj ~  age_at_sample_exact + BCR_ABL1 + (1 + age_at_sample_exact | Patient),
+    data = per_sample_statistics.n799.df,
+    REML = F
+  )
+
+model.check(SNV.lmer2_2)
+```
+
+##### Check optimisers
+
+```{r}
+SNV.lmer2_2.af <- allFit(SNV.lmer2_2)
+
+all_fit.summary(SNV.lmer2_2.af)
+```
+
+##### Plot optimiser outputs
+
+```{r fig.width = 10, fig.height = 4, out.width="100%"}
+all_fit.compare(SNV.lmer2_2.af)
+```
+
+##### Select best optimiser
+
+```{r}
+SNV.lmer2_2 <- SNV.lmer2_2.af$Nelder_Mead
+
+model.check(SNV.lmer2_2)
+```
+
+#### Model 3
+
+```{r}
+SNV.lmer2_3 <-
+  lmer(
+    nsub_adj ~  age_at_sample_exact + BCR_ABL1 + (1 + BCR_ABL1 | Patient),
+    data = per_sample_statistics.n799.df, REML = F
+  )
+
+model.check(SNV.lmer2_3)
+```
+
+### Model comparison
+
+-   SNV.lmer2_2: nsub_adj \~ age_at_sample_exact + BCR_ABL1 + (1 + age_at_sample_exact \| Patient)
+
+-   SNV.lmer2_3: nsub_adj \~ age_at_sample_exact + BCR_ABL1 + (1 + BCR_ABL1 \| Patient)
+
+Both models are improvements over the baseline model's fit to the data (`r deparse(substitute(SNV.lmer2_1))`; BIC=`r round(BIC(SNV.lmer2_1),2)`), with `r deparse(substitute(SNV.lmer2_3))` (BIC=`r round(BIC(SNV.lmer2_3),2)`) identified as the better model over `r deparse(substitute(SNV.lmer2_2))` (BIC=`r round(BIC(SNV.lmer2_2),2)`).
+
+```{r}
+tab_model(
+  SNV.lmer2_1,
+  SNV.lmer2_2,
+  SNV.lmer2_3,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific",
+  dv.labels = c(
+    "Baseline (SNV.lmer2_1)",
+    "Random age effect and intercept: (SNV.lmer2_2)",
+    "Random driver effect and intercept: (SNV.lmer2_3)"
+  )
+)
+```
+
+#### ANOVA
+
+SNV.lmer2_1 vs. SNV.lmer2_2
+
+```{r}
+broom::tidy(anova(SNV.lmer2_1, SNV.lmer2_2)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+SNV.lmer2_1 vs. SNV.lmer2_3
+
+```{r}
+broom::tidy(anova(SNV.lmer2_1, SNV.lmer2_3)) %>%
+mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+### Further selection
+
+As we assume that SNV burden intercepts at the patient level will be similar, can we improve the model by removing the random effect intercept?
+
+```{r}
+SNV.lmer2_3_0r <-
+  lmer(
+    nsub_adj ~  age_at_sample_exact + BCR_ABL1 + (0 + BCR_ABL1 | Patient),
+    data = per_sample_statistics.n799.df, REML = F
+  )
+
+model.check(SNV.lmer2_3_0r)
+```
+
+Both models are functionally equivalent with identical BIC values, therefore we retain the model with the random intercept (SNV.lmer2_3).
+
+```{r}
+tab_model(
+  SNV.lmer2_3,
+  SNV.lmer2_3_0r,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific",
+  dv.labels = c(
+    "Random effect of driver status and intercept: (SNV.lmer2_3)",
+    "Random effect of driver status: (SNV.lmer2_3_0r)"
+  )
+)
+```
+
+#### ANOVA
+
+```{r}
+broom::tidy(anova(SNV.lmer2_3, SNV.lmer2_3_0r)) %>% 
+  mutate(p.value = format.pval(p.value, digits = 3, eps = 1e-50)) %>% tab_df()
+```
+
+## 3. Final model
+
+#### Refit with REML
+
+```{r}
+SNV.lmer2_3.REML <-
+  update(
+    SNV.lmer2_3,
+    REML = T,
+    control = lmerControl(
+      optimizer = SNV.lmer2_3@optinfo$optimizer,
+      optCtrl = SNV.lmer2_3@optinfo$control
+    )
+  )
+
+model.check(SNV.lmer2_3.REML)
+```
+
+#### Check model
+
+```{r , fig.height = 15, fig.width = 10, out.width="100%"}
+check_model(SNV.lmer2_3.REML)
+```
+
+### Model summary
+
+```{r}
+tab_model(
+  SNV.lmer2_3.REML,
+  show.se = T,
+  show.stat = T,
+  show.ci = F,
+  show.p = F,
+  p.style = "scientific"
+)
+```
+
+### Bootstrapped fixed effects CIs
+
+```{r Bootstrap, eval = params$boot}
+set.seed(1234)
+
+SNV.lmer2_3_par_boot <-
+  bootstrap(
+    SNV.lmer2_3.REML,
+    .f = fixef,
+    type = "parametric",
+    B = 3000
+  )
+SNV.lmer2_3_par_boot
+```
+
+#### Restricted to first 1000/`r SNV.lmer2_3_par_boot$B` bootstrapped models
+
+```{r, eval = params$boot}
+SNV.lmer2_3_par_boot2 <- SNV.lmer2_3_par_boot
+SNV.lmer2_3_par_boot2$replicates <- SNV.lmer2_3_par_boot$replicates[1:1000, ]
+lmeresampler:::confint.lmeresamp(SNV.lmer2_3_par_boot2, type = "perc") %>% tab_df()
+```
+
+```{r, eval = params$boot}
+keep.lgl.vec <- sapply(SNV.lmer2_3_par_boot$message, is.null) & sapply(SNV.lmer2_3_par_boot$warning, is.null) & sapply(SNV.lmer2_3_par_boot$error, is.null)
+```
+
+#### Restricted to `r sum(keep.lgl.vec)` converged non-singular bootstrapped models
+
+```{r, eval = params$boot}
+SNV.lmer2_3_par_boot3 <- SNV.lmer2_3_par_boot
+SNV.lmer2_3_par_boot3$replicates <- SNV.lmer2_3_par_boot$replicates[keep.lgl.vec, ][1:1000,]
+lmeresampler:::confint.lmeresamp(SNV.lmer2_3_par_boot3, type = "perc") %>% tab_df()
+```
+
+#### Plot model
+
+```{r , fig.height = 10, fig.width = 14, out.width="100%", eval = params$boot}
+
+d <-
+  ggpredict(
+    model = SNV.lmer2_3.REML,
+    terms = c("age_at_sample_exact [0:90 by=5]", "BCR_ABL1"),
+    ci.lvl = 0.95,
+    type = "fe"
+  )
+
+d %>% as_tibble() %>%
+  mutate(!!sym(get_legend_title(d)) := group) %>%
+  ggplot(aes(
+    x = x,
+    y = predicted,
+    group = !!sym(get_legend_title(d)),
+  )) +
+  geom_line(aes(colour = !!sym(get_legend_title(d)))) +
+  geom_ribbon(aes(
+    ymin = conf.low,
+    ymax = conf.high,
+    fill  = !!sym(get_legend_title(d))
+  ), alpha = 0.2) +
+  geom_quasirandom(
+    data = attr(d, "rawdata") %>% mutate(!!sym(get_legend_title(d)) := group),
+    aes(x = x, y = response, colour = group),
+    alpha = 0.5
+  ) +
+  scale_colour_manual(name = "BCR::ABL1 status", values = driver.palette2) +
+  scale_fill_manual(name = "BCR::ABL1 status", values = driver.palette2) +
+  xlab(get_x_title(d)) +
+  ylab(get_y_title(d)) +
+  new_scale_fill() +
+  geom_abline(
+    data = as_tibble(list(
+      a = c(95.6),
+      b = c(17.0),
+      `Reference trend` = c("Williams et al. 17bp/year")
+    )),
+    aes(
+      intercept = a,
+      slope = b,
+      fill  = `Reference trend`
+    ),
+    lty = 2,
+    show.legend = T
+  )  +
+  ggtitle(unlist(str_split(
+    as.character(SNV.lmer2_3.REML@call), pattern = "\\="
+  ))[2]) +
+  theme_bw(base_size = 16) 
+```
+
+### Figure 3a
+
+Number of SNVs carried by sequenced colonies, coloured by driver status (*BCR::ABL1*, Other driver and wild-type) and their relationship with age, with mixed model trend lines. Red trend lines for colonies which are *BCR::ABL1*-positive and grey for *BCR::ABL1*-negative colonies.
+
+```{r , fig.height = 10, fig.width = 14, out.width="100%", eval = params$boot}
+
+Figure_3a_v2 <-
+d %>% as_tibble() %>%
+  mutate(group = case_when(group == "Wt" ~"Absence", group == "Mt" ~"Presence")) %>% 
+  mutate(`*BCR::ABL1* status` := group) %>%
+  ggplot(aes(
+    x = x,
+    y = predicted,
+    group = `*BCR::ABL1* status`,
+  )) +
+  geom_line(aes(colour = `*BCR::ABL1* status`)) +
+  geom_ribbon(aes(
+    ymin = conf.low,
+    ymax = conf.high,
+    fill  = `*BCR::ABL1* status`
+  ), alpha = 0.2) +
+  scale_colour_manual(name = "*BCR::ABL1* status", values = driver.palette2b) +
+  scale_fill_manual(name = "*BCR::ABL1* status", values = driver.palette2b) +
+  new_scale_fill() +
+  new_scale_colour() +
+  geom_quasirandom(
+    data = plot3a.per_sample_statistics.n834.df %>%
+    mutate(response = nsub_adj, x = age_at_sample_exact, group = driver2) %>% mutate(`Driver status` = factor(
+      driver2,
+      levels = c("BCR_ABL", "WT", "Other"),
+      labels = c("*BCR::ABL1*", "Wild-type", "Other")
+    )) %>% mutate(`*BCR::ABL1* status` := group),
+    aes(x = x, y = response, colour = `Driver status`),
+    alpha = 0.5
+  ) +
+  scale_colour_manual(values = driver.palette) +
+  xlab(get_x_title(d)) +
+  ylab(get_y_title(d)) +
+  guides(colour = guide_legend(override.aes = list(linetype = c(rep(0, length(driver.palette)))))) + 
+  new_scale_fill() +
+  geom_abline(
+    data = as_tibble(list(
+      a = c(95.6),
+      b = c(17.0),
+      `Reference trend` = c("Williams et al. 17bp/year")
+    )),
+    aes(
+      intercept = a,
+      slope = b,
+      fill  = `Reference trend`
+    ),
+    lty = 2,
+    show.legend = T
+  )  +
+  ggtitle(unlist(str_split(
+    as.character(SNV.lmer2_3.REML@call), pattern = "\\="
+  ))[2]) +
+  theme_bw(base_size = 16) +
+  theme(legend.title = element_markdown(), legend.text = element_markdown()) 
+
+Figure_3a_v2  
+ggsave(filename = paste0("../figures/v1/", "figure_3a_V1.pdf"), plot = Figure_3a_v2, width = 9, height = 5.625 )
+
+```
+
+### Figure 3f
+
+Per sample dot plot for PD51635, describing mean C\>T at CpG proportion (excluding *BCR::ABL1* clade trunk in *BCR::ABL1*-positive colonies) by sample *BCR::ABL1* fusion status, faceted by time of sampling and annotated by per sample driver status.
+
+```{r}
+PD51635.ctcpg_frq <-
+  per_sample_statistics.n799.df %>%
+  filter(Patient == "PD51635") %>%
+  mutate(ctcpg_frq = case_when(BCR_ABL1 == "Mt" ~ ((nsub_ctcpg_adj - n_C_T_Trunk) / (nsub_adj - n_Trunk_total)
+  ),
+  TRUE ~ (nsub_ctcpg_adj / nsub_adj))) 
+
+PD51635.ctcpg_frq %>% mutate(age_at_sample_exact = as.character(age_at_sample_exact)) %>% count(age_at_sample_exact, BCR_ABL1) %>% addTotal() %>%  tab_df(col.header = c("Age at sample timepoint", "BCR::ABL1 fusion status", "n"))
+```
+
+```{r, fig.height = 4.5, fig.width = 4.5, out.width="50%"}
+
+Figure_3f.dat <-
+  PD51635.ctcpg_frq %>%
+  mutate(
+    group = paste0(Patient, BCR_ABL1),
+    # Age = as.character(age_at_sample_exact),
+    Patient = factor(
+      Patient,
+      levels = c(
+        "PD57334",
+        "PD56961",
+        "PD57335",
+        "PD51634",
+        "PD51633",
+        "PD51632",
+        "PD51635",
+        "PD57333",
+        "PD57332"
+      )
+    ),
+    `*BCR::ABL1* status` = factor(
+      BCR_ABL1,
+      levels = c("Mt", "Wt"),
+      labels = c("+", "-")
+    ),
+     `Driver status` = factor(
+      driver2,
+      levels = c("BCR_ABL", "Other", "WT"),
+      labels = c("*BCR::ABL1*", "Other", "Wild-type")
+    ),
+    `C>T at CpG proportion` = ctcpg_frq,
+    `Mutations SNV (adjusted)` = nsub_adj,
+    `Age (years)` = age_at_sample_exact
+  ) 
+  
+Figure_3f <-
+Figure_3f.dat %>%   
+  ggplot(aes( `*BCR::ABL1* status`,
+             `C>T at CpG proportion`,
+             colour = `Driver status`,
+             group.by = group,)) +
+  geom_quasirandom(width = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = driver.palette) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.title = element_markdown(),
+    legend.text = element_markdown(),
+    axis.title.x = element_markdown(),
+  ) +
+  facet_nested(~ Patient + `Age (years)`, scales = "free_x") +
+  force_panelsizes(cols = c(1, 2)) + theme(panel.spacing = unit(0, "lines"))
+
+Figure_3f
+ggsave(filename = paste0("../figures/v1/", "figure_3f_V1.pdf"), plot = Figure_3f, width = 4.5, height =4.5 )
+
+```
+
+## SessionInfo
+```{r}
+sessionInfo()
+```

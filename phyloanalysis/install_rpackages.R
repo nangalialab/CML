@@ -26,6 +26,8 @@ install.packages("lme4")
 install.packages("nlme")
 install.packages("see")
 install.packages("TeachingDemos")
+install.packages("Hmisc")
+install.packages("dfoptim")
 if (!require("BiocManager", quietly = TRUE))
   install.packages("BiocManager")
 BiocManager::install("MutationalPatterns")
@@ -40,4 +42,3 @@ devtools::install_github("kgori/sigfit", build_vignettes = TRUE,
 install.packages("rtreefit_1.1.0.tar.gz",repos=NULL,type="source") ## More recent than the public version.
 install.packages("rsimpop_2.4.1.tar.gz",repos=NULL,type="source") 
 devtools::install_git("https://github.com/nangalialab/treemut")
-inst
