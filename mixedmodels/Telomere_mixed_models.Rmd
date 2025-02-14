@@ -646,7 +646,7 @@ tab_model(
   show.ci = F,
   show.p = F,
   p.style = "scientific",
-  dv.labels = c("Baseline (SNV.lmer_0)", "Driver as fixed effect (SNV.lmer2_1)")
+  dv.labels = c("Baseline (tel.lmer2_0)", "Driver as fixed effect (tel.lmer2_1)")
 )
 ```
 

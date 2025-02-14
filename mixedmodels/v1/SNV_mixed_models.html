@@ -2960,14 +2960,14 @@ get_formula &lt;- function(model) {
 <h2>Data</h2>
 <pre class="r"><code>per_sample_statistics.n834.df &lt;- 
   read_csv(&quot;../data/per_sample_statistics.n834.csv&quot;)
-## New names:
-## Rows: 834 Columns: 32
-## ── Column specification
-## ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Delimiter: &quot;,&quot; chr
-## (7): Patient, Sample, tip.label, driver3, platform_unit, run_id.uniq, status dbl (25): ...1, age_at_sample_exact, meanvaf, rho.bb, meandepth, sensitivity, F1, F2, F4, Psi,
-## Insert_mean, Insert_sd, Read_length, Initial_read_length, F2a, Length, Se...
-## ℹ Use `spec()` to retrieve the full column specification for this data. ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
-## • `` -&gt; `...1`
+## Rows: 834 Columns: 28
+## ── Column specification ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+## Delimiter: &quot;,&quot;
+## chr  (7): Patient, Sample, tip.label, driver3, platform_unit, run_id.uniq, status
+## dbl (21): ...1, age_at_sample_exact, F1, F2, F4, Psi, Insert_mean, Insert_sd, Read_length, Initial_read_length, F2a, Length, Seq.X, library, run_id.count, read_...
+## 
+## ℹ Use `spec()` to retrieve the full column specification for this data.
+## ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
 
 driver.palette &lt;- c(`Wild-type` = &quot;#0072B5FF&quot;, Other =&quot;#E18727FF&quot;,  `*BCR::ABL1*`=&quot;#BC3C29FF&quot;)
 driver.palette1 &lt;- c(WT = &quot;#0072B5FF&quot;, Other =&quot;#E18727FF&quot;,  BCR_ABL=&quot;#BC3C29FF&quot;)
@@ -5528,8 +5528,8 @@ Figure_3f</code></pre>
 ##  [29] survival_3.2-13      zoo_1.8-12           glue_1.6.2           gtable_0.3.4         emmeans_1.8.7        sjstats_0.18.2       sjmisc_2.8.9        
 ##  [36] distributional_0.3.2 mvtnorm_1.1-3        Rcpp_1.0.10          viridisLite_0.4.2    xtable_1.8-4         gridtext_0.1.5       htmlTable_2.4.2     
 ##  [43] foreign_0.8-82       bit_4.0.5            Formula_1.2-5        datawizard_0.7.1     htmlwidgets_1.6.2    httr_1.4.5           ellipsis_0.3.2      
-##  [50] pkgconfig_2.0.3      farver_2.1.1         nnet_7.3-17          sass_0.4.7           utf8_1.2.3           janitor_2.2.0        tidyselect_1.2.0    
-##  [57] labeling_0.4.3       rlang_1.1.1          reshape2_1.4.4       effectsize_0.8.3     munsell_0.5.0        nlmeU_0.70-9         tools_4.1.3         
+##  [50] pkgconfig_2.0.3      farver_2.1.1         nnet_7.3-17          sass_0.4.7           utf8_1.2.3           janitor_2.2.0        effectsize_0.8.3    
+##  [57] tidyselect_1.2.0     labeling_0.4.3       rlang_1.1.1          reshape2_1.4.4       munsell_0.5.0        nlmeU_0.70-9         tools_4.1.3         
 ##  [64] cachem_1.0.8         cli_3.6.1            generics_0.1.3       sjlabelled_1.2.0     broom_1.0.4          evaluate_0.23        fastmap_1.1.1       
 ##  [71] ragg_1.2.5           yaml_2.3.7           knitr_1.45           bit64_4.0.5          future_1.33.0        nlme_3.1-155         pracma_2.4.2        
 ##  [78] xml2_1.3.3           compiler_4.1.3       rstudioapi_0.14      beeswarm_0.4.0       statmod_1.5.0        bslib_0.4.2          stringi_1.8.2       
