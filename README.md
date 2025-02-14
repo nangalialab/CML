@@ -11,5 +11,7 @@ cd phyloanalysis
 Rscript run_all.R
 ```
 
-Previously generated versions of the plots and tables are in figures/v1 and export/v1
+Previously generated versions of the plots, tables and markdown HTMLs are in figures/v1 and export/v1 and mixedmodels/v1
+
+The above takes about 6 hours to run on a 4 core CPU (Intel(R) Xeon(R) Gold 6226R CPU @ 2.90GHz).  The code has been tested on mac0S Sequoia and Ubuntu Jammy.   
 
