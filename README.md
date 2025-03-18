@@ -1,4 +1,4 @@
-### Files to reproduce figures and tables in the paper "Timing the Philadelphia chromosome and trajectory to chronic myeloid leukaemia"
+### Files to reproduce figures and tables in the paper "Timing and trajectory of BCR::ABL1 driven chronic myeloid leukaemia"
 This produces some figures and files that are used in downstream analysis.
 
 ### Dependencies
