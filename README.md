@@ -15,3 +15,5 @@ Previously generated versions of the plots, tables and markdown HTMLs are in fig
 
 The above takes about 6 hours to run on a 4 core CPU (Intel(R) Xeon(R) Gold 6226R CPU @ 2.90GHz).  The code has been tested on mac0S Sequoia and Ubuntu Jammy.   
 
+A manifest indicating the QC status of samples available on EGA is in the "data/EGAD00001015353.sample_manifest.n1023.csv"
+
